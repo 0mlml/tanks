@@ -1,0 +1,651 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <title>Tank game</title>
+</head>
+
+<body>
+    <canvas style="position:absolute;width:100vw;height:100vh;top:0;left:0"></canvas>
+    <script>
+        const vnSeed = Math.random() * 100;
+
+        function fractional(val) {
+            return val - Math.floor(val);
+        }
+
+        function lerp(start, end, weight) {
+            return (1 - weight) * start + weight * end;
+        }
+
+        function vnHash(x, y) {
+            x = 50 * fractional(x * 0.3183099 + 0.71);
+            y = 50 * fractional(y * 0.3183099 + 0.113);
+            return -1 + 2 * fractional(1.375986 * vnSeed + x * y * (x + y));
+        }
+
+        function valueNoise(x, y) {
+            const ix = Math.floor(x),
+                iy = Math.floor(y),
+                fx = fractional(x),
+                fy = fractional(y),
+                ux = fx * fx * (3 - 2 * fx);
+            return lerp(
+                lerp(vnHash(ix, iy), vnHash(ix + 1, iy), ux),
+                lerp(vnHash(ix, iy + 1), vnHash(ix + 1, iy + 1), ux),
+                fy * fy * (3 - 2 * fy)
+            );
+        }
+
+
+        const canvas = document.querySelector('canvas');
+        const ctx = canvas.getContext('2d');
+
+        canvas.width = window.innerWidth;
+        canvas.height = window.innerHeight;
+
+        const ground = [];
+        let offset = 0;
+
+        (function fillWorld() {
+            for (let x = 0; x < canvas.width; x++) {
+                ground.push(Math.floor(valueNoise(x / 200, 1) * 100) - 200);
+            }
+        })();
+
+        const groundSpeed = 3;
+        const barrelSpeed = 0.05;
+        const keys = new Map();
+        function actOnKeys() {
+            if (keys.get('ArrowRight')) {
+                offset -= groundSpeed;
+                shiftWorld(groundSpeed);
+                enemies.forEach(e => e.shift(-groundSpeed));
+                DogTag.existing.forEach(d => d.shift(-groundSpeed));
+                Shell.existing.forEach(p => p.shift(-groundSpeed));
+                Laser.existing.forEach(l => l.shift(-groundSpeed));
+            }
+            if (keys.get('ArrowLeft')) {
+                offset += groundSpeed;
+                shiftWorld(-groundSpeed);
+                enemies.forEach(e => e.shift(groundSpeed));
+                DogTag.existing.forEach(d => d.shift(groundSpeed));
+                Shell.existing.forEach(p => p.shift(groundSpeed));
+                Laser.existing.forEach(l => l.shift(groundSpeed));
+            }
+            if (keys.get('ArrowUp')) {
+                player.barrelPitch -= barrelSpeed;
+                if (player.barrelPitch < 0) {
+                    player.barrelPitch = Math.PI * 2;
+                }
+            }
+            if (keys.get('ArrowDown')) {
+                player.barrelPitch += barrelSpeed;
+                if (player.barrelPitch > Math.PI * 2) {
+                    player.barrelPitch = 0;
+                }
+            }
+            if (keys.get(' ')) {
+                player.shell();
+                keys.delete(' ');
+            }
+        }
+        document.addEventListener('keydown', (event) => {
+            keys.set(event.key, true);
+        });
+        document.addEventListener('keyup', (event) => {
+            keys.delete(event.key);
+        });
+        document.addEventListener('mousedown', (event) => {
+            const x = event.clientX;
+            const y = event.clientY;
+            player.barrelPitch = Math.atan2(y - player.y, x - player.x);
+            player.shell();
+        });
+
+        function drawWorld() {
+            for (let x = 0; x < canvas.width; x++) {
+                ctx.fillStyle = 'black';
+                ctx.fillRect(x, canvas.height, 1, ground[x]);
+            }
+        }
+
+        function trySpawnTank(delta) {
+            if (Math.random() > 0.01) {
+                return;
+            }
+            let canSpawn = true;
+            const desiredX = delta > 0 ? canvas.width + delta : delta;
+            enemies.forEach(tank => {
+                if (Math.abs(tank.x - desiredX) < 150) {
+                    canSpawn = false;
+                }
+            });
+            if (canSpawn) {
+                enemies.push(new Tank(desiredX));
+            }
+        }
+
+        function shiftWorld(delta) {
+            const width = canvas.width;
+
+            if (delta > 0) {
+                ground.splice(0, delta);
+                for (let x = width - delta - offset; x < width - offset; x++) {
+                    ground.push(Math.floor(valueNoise((x) / 200, 1) * 100) - 200);
+                }
+            } else {
+                delta = Math.abs(delta);
+                ground.splice(width - delta, delta);
+                for (let x = delta - offset; x > -offset; x--) {
+                    ground.unshift(Math.floor(valueNoise((-delta + x) / 200, 1) * 100) - 200);
+                }
+            }
+            trySpawnTank(delta);
+        }
+
+        function getSlope(points) {
+            return (points[points.length - 1] - points[0]) / 2;
+        }
+
+        function calculateProjectileAngle(guess, x1, y1, x2, y2, launchSpeed) {
+            const g = Shell.gravity;
+            const dx = x2 - x1;
+            const dy = y2 - y1;
+            const v = launchSpeed;
+
+            guess = Math.atan2(dy, dx);
+            if (dx < 0) {
+                guess += Math.PI / 4;
+            } else {
+                guess -= Math.PI / 4;
+            }
+
+            const maxIterations = 25;
+
+            let best = { angle: guess, hitType: UNKNOW_HIT, error: Number.MAX_SAFE_INTEGER, x: 0, y: 0 };
+            let iter = 0;
+            while (iter < maxIterations) {
+                iter++;
+
+                let result = simulateProjectile(v, best.angle, x1, y1, x2, y2);
+
+                let error = result.x - x2;
+
+                if (Math.abs(error) < best.error) {
+                    best.error = Math.abs(error);
+                    best.hitType = result.result;
+                    best.x = result.x;
+                    best.y = result.y;
+
+                    if (result.result === TARGET_HIT) {
+                        break;
+                    }
+                }
+
+                let angleStep = 0.002;
+                if (Math.abs(error) > 200) {
+                    angleStep = 0.1;
+                } else if (Math.abs(error) > 100) {
+                    angleStep = 0.05;
+                } else if (Math.abs(error) > 50) {
+                    angleStep = 0.01;
+                } else if (Math.abs(error) > 10) {
+                    angleStep = 0.005;
+                }
+
+                if (error > 0) {
+                    best.angle -= angleStep;
+                } else {
+                    best.angle += angleStep;
+                }
+
+                best.angle = normalizeAngle(best.angle);
+            }
+
+            return best;
+        }
+
+
+        const UNKNOW_HIT = 0;
+        const GROUND_HIT = 1;
+        const OOB_HIT = 2;
+        const TARGET_HIT = 3;
+        function simulateProjectile(launchSpeed, angle, ix, iy, tx, ty, timeStep = 0.1) {
+            const vX = launchSpeed * Math.cos(angle);
+            const vY = launchSpeed * Math.sin(angle);
+
+            let x = ix;
+            let y = iy;
+            let t = 0;
+            ctx.save();
+            ctx.beginPath();
+            ctx.moveTo(x, y);
+            while (x >= 0 && x < canvas.width && y <= canvas.height + ground[Math.floor(x)]) {
+                x = ix + vX * t;
+                y = iy + vY * t + 0.5 * Shell.gravity * Math.pow(t, 2);
+
+                if (y > canvas.height + ground[Math.floor(x)]) {
+                    return { result: GROUND_HIT, x, y };
+                }
+
+                if (Math.abs(x - tx) < 10 && Math.abs(y - ty) < 5) {
+                    return { result: TARGET_HIT, x, y };
+                }
+
+                t += timeStep;
+
+                ctx.lineTo(x, y);
+            }
+
+            if (x >= canvas.width || x < 0 || y > canvas.height + ground[Math.floor(x)]) {
+                return { result: OOB_HIT, x, y };
+            } else {
+                return { result: GROUND_HIT, x, y };
+            }
+        }
+
+        class Shell {
+            static existing = [];
+            static gravity = 0.5;
+
+            constructor(x, y, dx, dy) {
+                this.x = x;
+                this.y = y;
+                this.vx = dx;
+                this.vy = dy;
+                this.ax = 0;
+                this.ay = 0;
+                Shell.existing.push(this);
+            }
+
+            update() {
+                this.vy += Shell.gravity;
+
+                this.x += this.vx;
+                this.y += this.vy;
+
+                if (this.y > canvas.height + ground[Math.floor(this.x)] || this.x < 0 || this.x >= canvas.width) {
+                    this.x = Math.floor(this.x);
+                    this.#explode();
+                }
+            }
+
+            shift(delta) {
+                this.x += delta;
+            }
+
+            #explode() {
+                Shell.existing.splice(Shell.existing.indexOf(this), 1);
+                for (let i = - 10; i < 10; i++) {
+                    if (typeof ground[this.x + i] !== 'undefined') {
+                        ground[this.x + i] += Math.floor(Math.sqrt(Math.floor(100 - Math.abs(i * 10)))) / 2;
+                    }
+                }
+                Tank.existing.forEach(tank => {
+                    if (Math.abs((tank.x + tank.width / 2) - this.x) < 15) {
+                        new DogTag(tank.x, tank.y);
+                        Tank.existing.splice(Tank.existing.indexOf(tank), 1);
+                        tank.offScreen = true;
+                        tank.x = -100;
+                    }
+                });
+                ctx.save();
+                ctx.fillStyle = 'red';
+                ctx.beginPath();
+                ctx.ellipse(this.x, this.y, 15, 15, 0, 0, Math.PI * 2);
+                ctx.fill();
+                ctx.restore();
+            }
+
+            static updateAll() {
+                Shell.existing.forEach(p => p.update());
+            }
+
+            render() {
+                ctx.save();
+                ctx.beginPath();
+                ctx.fillStyle = '#ff0000';
+                ctx.ellipse(this.x, this.y, 2, 2, 0, 0, Math.PI * 2);
+                ctx.fill();
+                ctx.restore();
+            }
+
+            static renderAll() {
+                Shell.existing.forEach(p => p.render());
+            }
+        }
+
+        class Laser {
+            static existing = [];
+            static #threshold = 20;
+
+            constructor(x, y, angle) {
+                this.ix = x;
+                this.iy = y;
+                const result = this.#raycast();
+                this.tx = result.tx;
+                this.ty = result.ty;
+                this.angle = angle;
+                this.progress = 0;
+                Laser.existing.push(this);
+            }
+
+            #raycast() {
+                let x = this.ix;
+                let y = this.iy;
+                let t = 0;
+                let dx = Math.cos(this.angle);
+                let dy = Math.sin(this.angle);
+                while (x >= 0 && x < canvas.width && y <= canvas.height + ground[Math.floor(x)]) {
+                    x = this.ix + dx * t;
+                    y = this.iy + dy * t;
+                    t += 0.1;
+                }
+                return { tx: x, ty: y };
+            }
+
+            update() {
+                this.progress++;
+                if (this.progress > Laser.#threshold) {
+                    this.#explode();
+                }
+                const result = this.#raycast();
+                this.tx = result.tx;
+                this.ty = result.ty;
+            }
+
+            shift(delta) {
+                this.ix += delta;
+                this.tx += delta;
+            }
+
+            static updateAll() {
+                Laser.existing.forEach(l => l.update());
+            }
+
+            #explode() {
+                Laser.existing.splice(Laser.existing.indexOf(this), 1);
+                const laserLength = Math.sqrt(Math.pow(this.tx - this.ix, 2) + Math.pow(this.ty - this.iy, 2));
+                Tank.existing.forEach(tank => {
+                    for (let d = 0; d < laserLength; d++) {
+                        const x = this.ix + Math.cos(this.angle) * d;
+                        const y = this.iy + Math.sin(this.angle) * d;
+                        if (Math.abs(tank.x - x) < 5 && Math.abs(tank.y - y) < 15) {
+                            new DogTag(tank.x, tank.y);
+                            Tank.existing.splice(Tank.existing.indexOf(tank), 1);
+                            tank.offScreen = true;
+                            tank.x = -100;
+                        }
+                    }
+                });
+            }
+
+            render() {
+                ctx.save();
+                ctx.strokeStyle = 'red';
+                ctx.lineWidth = this.progress / Laser.#threshold * 5;
+                ctx.beginPath();
+                ctx.moveTo(this.ix, this.iy);
+                ctx.lineTo(this.tx, this.ty);
+                ctx.stroke();
+                ctx.restore();
+            }
+
+            static renderAll() {
+                Laser.existing.forEach(l => l.render());
+            }
+        }
+
+        function normalizeAngle(a) {
+            if (a > Math.PI * 2) {
+                a -= Math.PI * 2;
+            } else if (a < 0) {
+                a += Math.PI * 2;
+            }
+            return a;
+        }
+
+        function getShortestRot(current, target) {
+            let difference = normalizeAngle(target) - normalizeAngle(current);
+
+            if (difference > Math.PI) {
+                difference -= 2 * Math.PI;
+            } else if (difference < -Math.PI) {
+                difference += 2 * Math.PI;
+            }
+
+            return difference;
+        }
+
+        class Tank {
+            static existing = [];
+
+            constructor(x) {
+                this.x = typeof x === 'undefined' ? Math.floor(canvas.width / 2) : Math.floor(x);
+                this.y = Math.floor(canvas.height / 2);
+                this.roll = 0;
+                this.barrelPitch = 0;
+                this.offScreen = this.x < 3 || this.x > canvas.width - 3;
+                this.width = 30;
+                this.height = 11;
+                this.nextFire = 0;
+                this.firingOffset = 0;
+                Tank.existing.push(this);
+            }
+
+            update() {
+                if (this.x < 3 || this.x > canvas.width - 3) {
+                    this.roll = 0;
+                    this.offScreen = true;
+                    return;
+                } else {
+                    this.offScreen = false;
+                }
+                let portion = ground.slice(this.x - 3, this.x + 3);
+                let dx = 6;
+                let dy = getSlope(portion);
+                this.roll = Math.atan2(dy, dx);
+                this.y = canvas.height + ground[this.x];
+            }
+
+            static updateAll() {
+                Tank.existing.forEach(t => t.update());
+            }
+
+            shift(delta) {
+                this.x += delta;
+            }
+
+            render() {
+                if (this.offScreen) {
+                    return;
+                }
+                ctx.save();
+                ctx.translate(this.x, this.y - this.height / 2);
+                ctx.rotate(this.roll * 2);
+                ctx.fillStyle = '#44aa44';
+                ctx.fillRect(-this.width / 2, -this.height / 2, this.width, this.height);
+                ctx.fillStyle = '#225522';
+                ctx.beginPath();
+                ctx.roundRect(-this.width / 2 - this.width / 16, this.height / 2 - this.height / 16, this.width + this.width / 8, this.height * 0.8, this.height / 8);
+                ctx.closePath();
+                ctx.fill();
+                ctx.rotate(-this.roll * 2);
+                ctx.rotate(this.barrelPitch);
+                ctx.fillStyle = '#228822';
+                ctx.fillRect(-this.width * 0.1, -this.height / 6, this.width * 0.7, this.height * 0.5);
+                ctx.restore();
+            }
+
+            static renderAll() {
+                Tank.existing.forEach(t => t.render());
+            }
+
+            tankType = 0;
+            enemyAI(playerTank) {
+                if (this.offScreen) {
+                    return;
+                }
+                if (!this.tankType) {
+                    this.tankType = Math.random() > 0.5 ? 1 : 2;
+                }
+                if (this.tankType === 1) {
+                    this.shellEnemyAI(playerTank);
+                } else if (this.tankType === 2) {
+                    this.laserEnemyAI(playerTank);
+                }
+            }
+
+            laserEnemyAI(playerTank) {
+                if (this.offScreen) {
+                    return;
+                }
+
+                const playerAngle = Math.atan2(playerTank.y - this.y, playerTank.x - this.x);
+
+                this.targetPitch = playerAngle + this.firingOffset;
+
+                const difference = getShortestRot(this.barrelPitch, this.targetPitch);
+                if (Math.abs(difference) < barrelSpeed * 2) {
+                    this.barrelPitch = this.targetPitch;
+                    if (performance.now() > this.nextFire) {
+                        this.firingOffset = Math.random() * 0.05 - 0.025;
+                        const firingPenalty = 3000 - Math.abs(this.firingOffset) / 0.05 * 3000;
+                        this.nextFire = performance.now() + firingPenalty;
+                        this.laser();
+                    }
+                } else if (difference > 0) {
+                    this.barrelPitch += barrelSpeed;
+                } else {
+                    this.barrelPitch -= barrelSpeed;
+                }
+            }
+
+            static #launchSpeed = 25;
+            shellEnemyAI(playerTank) {
+                if (this.offScreen) {
+                    return;
+                }
+
+                const result = calculateProjectileAngle(this.barrelPitch, this.x, this.y - this.height / 2, playerTank.x, playerTank.y, Tank.#launchSpeed);
+                if (Math.abs(result.x - this.x) < this.width) {
+                    return;
+                }
+
+                const angle = result.angle;
+                const difference = getShortestRot(this.barrelPitch, angle);
+                if (Math.abs(difference) < barrelSpeed * 2) {
+                    this.barrelPitch = angle;
+                    if (performance.now() > this.nextFire) {
+                        const firingPenalty = 3000;
+                        this.nextFire = performance.now() + firingPenalty;
+                        this.shell();
+                    }
+                } else if (difference > 0) {
+                    this.barrelPitch += barrelSpeed;
+                } else {
+                    this.barrelPitch -= barrelSpeed;
+                }
+            }
+
+            shell() {
+                if (this.offScreen) {
+                    return;
+                }
+                const dx = Math.cos(this.barrelPitch) * Tank.#launchSpeed;
+                const dy = Math.sin(this.barrelPitch) * Tank.#launchSpeed;
+                new Shell(this.x, this.y - this.height / 2, dx, dy);
+            }
+
+            laser() {
+                if (this.offScreen) {
+                    return;
+                }
+                const tipX = this.x + Math.cos(this.barrelPitch) * this.width * 0.65;
+                const tipY = this.y - this.height / 2 + Math.sin(this.barrelPitch) * this.width * 0.65;
+                new Laser(tipX, tipY, this.barrelPitch);
+            }
+        }
+
+        class DogTag {
+            static existing = [];
+
+            constructor(x, y) {
+                this.x = x;
+                this.y = y;
+                this.value = Math.floor(Math.random() * 100);
+                DogTag.existing.push(this);
+            }
+
+            render() {
+                ctx.save();
+                ctx.translate(this.x, this.y);
+                ctx.fillStyle = `hsl(${this.value}, 100%, 50%)`;
+                ctx.beginPath();
+                ctx.roundRect(-5, -5, 10, 10, 2);
+                ctx.closePath();
+                ctx.fill();
+                ctx.restore();
+            }
+
+            shift(delta) {
+                this.x += delta;
+            }
+
+            isTouching(tank) {
+                return Math.abs(this.x - tank.x) < 10 && Math.abs(this.y - tank.y) < 10;
+            }
+
+            static renderAll() {
+                DogTag.existing.forEach(d => d.render());
+            }
+
+            static collectAny(tank) {
+                DogTag.existing.forEach(d => {
+                    if (d.isTouching(tank)) {
+                        DogTag.existing.splice(DogTag.existing.indexOf(d), 1);
+                        score += d.value;
+                    }
+                });
+            }
+        }
+
+        const player = new Tank();
+        const enemies = [];
+        let score = 0;
+        enemies.push(new Tank(100));
+        enemies.push(new Tank(canvas.width - 100));
+
+        function drawScore() {
+            ctx.save();
+            ctx.fillStyle = 'black';
+            ctx.font = '24px sans-serif';
+            ctx.fillText(`Score: ${score}`, 10, 30);
+            ctx.restore();
+        }
+
+        (function render() {
+            actOnKeys();
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            drawWorld();
+            Tank.updateAll();
+            Tank.renderAll();
+            Shell.updateAll();
+            Shell.renderAll();
+            Laser.updateAll();
+            Laser.renderAll();
+            DogTag.renderAll();
+            DogTag.collectAny(player);
+            drawScore();
+            enemies.forEach(e => e.enemyAI(player));
+            requestAnimationFrame(render);
+        })();
+
+        (() => {
+            alert('Use the arrow keys to move and aim. Press space to fire. Click to aim+fire. Collect the dog tags to score points.');
+        })();
+    </script>
+</body>
+
+</html>
